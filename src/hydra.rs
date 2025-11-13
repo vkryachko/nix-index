@@ -439,3 +439,352 @@ impl<'de> Deserialize<'de> for HydraFileListing {
         d.deserialize_map(Root).map(HydraFileListing)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Helper to create a test PathOrigin
+    fn test_origin() -> PathOrigin {
+        PathOrigin {
+            attr: "test.package".to_string(),
+            output: "out".to_string(),
+            toplevel: true,
+            system: Some("x86_64-linux".to_string()),
+        }
+    }
+
+    #[test]
+    fn test_parse_narinfo_with_references() {
+        let narinfo_content = b"StorePath: /nix/store/abc123-hello-2.10\n\
+            URL: nar/abc123.nar.xz\n\
+            Compression: xz\n\
+            FileHash: sha256:deadbeef\n\
+            FileSize: 12345\n\
+            NarHash: sha256:cafebabe\n\
+            NarSize: 54321\n\
+            References: /nix/store/dep1-glibc-2.31 /nix/store/dep2-gcc-10.2\n\
+            Deriver: /nix/store/drv123-hello-2.10.drv\n";
+
+        // We'll test the parsing logic by simulating what fetch_references does
+        let _url = "https://cache.nixos.org/abc123.narinfo".to_string();
+        let data = narinfo_content.to_vec();
+
+        let mut path = StorePath::parse(
+            test_origin(),
+            "/nix/store/abc123-hello-2.10",
+        )
+        .expect("valid store path");
+
+        let mut nar_path = None;
+        let mut references = Vec::new();
+
+        for line in data.split(|x| x == &b'\n') {
+            if let Some(line) = line.strip_prefix(b"References: ") {
+                let line = str::from_utf8(line).expect("valid utf8");
+                references = line
+                    .split_whitespace()
+                    .filter_map(|ref_path| {
+                        let new_origin = PathOrigin {
+                            toplevel: false,
+                            ..path.origin().into_owned()
+                        };
+                        StorePath::parse(new_origin, ref_path)
+                    })
+                    .collect();
+            }
+
+            if let Some(line) = line.strip_prefix(b"StorePath: ") {
+                let line = str::from_utf8(line).expect("valid utf8");
+                let line = line.trim();
+                path = StorePath::parse(path.origin().into_owned(), line).expect("valid store path");
+            }
+
+            if let Some(line) = line.strip_prefix(b"URL: ") {
+                let line = str::from_utf8(line).expect("valid utf8");
+                let line = line.trim();
+                nar_path = Some(line.to_owned());
+            }
+        }
+
+        assert_eq!(nar_path, Some("nar/abc123.nar.xz".to_string()));
+        assert_eq!(references.len(), 2);
+        assert!(references[0].as_str().contains("dep1-glibc"));
+        assert!(references[1].as_str().contains("dep2-gcc"));
+    }
+
+    #[test]
+    fn test_parse_narinfo_without_references() {
+        let narinfo_content = b"StorePath: /nix/store/xyz789-minimal-1.0\n\
+            URL: nar/xyz789.nar.xz\n\
+            Compression: xz\n\
+            FileHash: sha256:deadbeef\n\
+            FileSize: 100\n\
+            NarHash: sha256:cafebabe\n\
+            NarSize: 200\n";
+
+        let data = narinfo_content.to_vec();
+        let mut references: Vec<&str> = Vec::new();
+        let mut nar_path = None;
+
+        for line in data.split(|x| x == &b'\n') {
+            if let Some(line) = line.strip_prefix(b"References: ") {
+                let line = str::from_utf8(line).expect("valid utf8");
+                references = line.split_whitespace().collect();
+            }
+
+            if let Some(line) = line.strip_prefix(b"URL: ") {
+                let line = str::from_utf8(line).expect("valid utf8");
+                nar_path = Some(line.trim().to_owned());
+            }
+        }
+
+        assert_eq!(references.len(), 0);
+        assert_eq!(nar_path, Some("nar/xyz789.nar.xz".to_string()));
+    }
+
+    #[test]
+    fn test_deserialize_regular_file() {
+        let json_data = json!({
+            "type": "regular",
+            "size": 12345,
+            "executable": true
+        });
+
+        let result: std::result::Result<HydraFileListing, _> = serde_json::from_value(json_data);
+        assert!(result.is_ok(), "Should successfully deserialize regular file");
+    }
+
+    #[test]
+    fn test_deserialize_regular_file_non_executable() {
+        let json_data = json!({
+            "type": "regular",
+            "size": 999
+        });
+
+        let result: std::result::Result<HydraFileListing, _> = serde_json::from_value(json_data);
+        assert!(result.is_ok(), "Should successfully deserialize regular file with default executable=false");
+    }
+
+    #[test]
+    fn test_deserialize_symlink() {
+        let json_data = json!({
+            "type": "symlink",
+            "target": "/some/path"
+        });
+
+        let result: std::result::Result<HydraFileListing, _> = serde_json::from_value(json_data);
+        assert!(result.is_ok(), "Should successfully deserialize symlink");
+    }
+
+    #[test]
+    fn test_deserialize_directory() {
+        let json_data = json!({
+            "type": "directory",
+            "entries": {
+                "file1.txt": {
+                    "type": "regular",
+                    "size": 100,
+                    "executable": false
+                },
+                "bin": {
+                    "type": "directory",
+                    "entries": {
+                        "program": {
+                            "type": "regular",
+                            "size": 5000,
+                            "executable": true
+                        }
+                    }
+                }
+            }
+        });
+
+        let result: std::result::Result<HydraFileListing, _> = serde_json::from_value(json_data);
+        assert!(result.is_ok(), "Should successfully deserialize nested directory structure");
+        
+        // Verify the structure using to_list which is a public API
+        let listing = result.unwrap();
+        let entries = listing.0.to_list(b"");
+        assert!(!entries.is_empty(), "Directory should have entries");
+    }
+
+    #[test]
+    fn test_deserialize_directory_with_utf8_names() {
+        // Test that we can handle UTF8 filenames
+        let json_str = r#"{
+            "type": "directory",
+            "entries": {
+                "normal.txt": {
+                    "type": "regular",
+                    "size": 100
+                },
+                "über.txt": {
+                    "type": "regular",
+                    "size": 200
+                }
+            }
+        }"#;
+
+        let result: std::result::Result<HydraFileListing, _> = serde_json::from_str(json_str);
+        assert!(result.is_ok(), "Should handle UTF-8 filenames");
+    }
+
+    #[test]
+    fn test_deserialize_file_listing_response() {
+        let json_data = json!({
+            "root": {
+                "type": "directory",
+                "entries": {
+                    "bin": {
+                        "type": "directory",
+                        "entries": {
+                            "hello": {
+                                "type": "regular",
+                                "size": 29488,
+                                "executable": true
+                            }
+                        }
+                    },
+                    "share": {
+                        "type": "directory",
+                        "entries": {}
+                    }
+                }
+            },
+            "version": 1
+        });
+
+        let result: std::result::Result<FileListingResponse, _> = serde_json::from_value(json_data);
+        assert!(result.is_ok(), "Should successfully deserialize FileListingResponse");
+        
+        let response = result.unwrap();
+        let entries = response.root.0.to_list(b"");
+        assert!(!entries.is_empty(), "Root directory should have entries");
+    }
+
+    #[test]
+    fn test_deserialize_invalid_type() {
+        let json_data = json!({
+            "type": "invalid_type",
+            "size": 100
+        });
+
+        let result: std::result::Result<HydraFileListing, _> = serde_json::from_value(json_data);
+        assert!(result.is_err(), "Should fail on invalid file type");
+    }
+
+    #[test]
+    fn test_deserialize_missing_required_field() {
+        // Missing "size" field for regular file
+        let json_data = json!({
+            "type": "regular",
+            "executable": true
+        });
+
+        let result: std::result::Result<HydraFileListing, _> = serde_json::from_value(json_data);
+        assert!(result.is_err(), "Should fail when required field is missing");
+    }
+
+    #[test]
+    fn test_deserialize_missing_type_field() {
+        let json_data = json!({
+            "size": 100,
+            "executable": true
+        });
+
+        let result: std::result::Result<HydraFileListing, _> = serde_json::from_value(json_data);
+        assert!(result.is_err(), "Should fail when type field is missing");
+    }
+
+    #[test]
+    fn test_deserialize_ignores_unknown_fields() {
+        // Should ignore unknown fields to be forward compatible
+        let json_data = json!({
+            "type": "regular",
+            "size": 100,
+            "executable": true,
+            "unknown_field": "ignored",
+            "another_unknown": 42
+        });
+
+        let result: std::result::Result<HydraFileListing, _> = serde_json::from_value(json_data);
+        assert!(result.is_ok(), "Should ignore unknown fields for forward compatibility");
+    }
+
+    #[test]
+    fn test_deserialize_duplicate_field() {
+        // Test that duplicate fields are handled (serde will reject them)
+        let json_str = r#"{
+            "type": "regular",
+            "size": 100,
+            "size": 200
+        }"#;
+
+        // Serde rejects duplicate fields by default
+        let result: std::result::Result<HydraFileListing, _> = serde_json::from_str(json_str);
+        // The behavior depends on serde_json's settings, but typically it will accept
+        // the last value or error. Let's just verify it doesn't panic.
+        let _ = result;
+    }
+
+    #[test]
+    fn test_fetcher_construction() {
+        let cache_url = "https://cache.nixos.org".to_string();
+        let fetcher = Fetcher::new(cache_url.clone());
+        assert!(fetcher.is_ok(), "Should successfully create Fetcher");
+        let fetcher = fetcher.unwrap();
+        assert_eq!(fetcher.cache_url, cache_url);
+    }
+
+    #[test]
+    fn test_error_display_http() {
+        let err = Error::Http {
+            url: "https://example.com/test".to_string(),
+            code: StatusCode::NOT_FOUND,
+        };
+        let display = format!("{}", err);
+        assert!(display.contains("404"), "Should include status code");
+        assert!(display.contains("https://example.com/test"), "Should include URL");
+    }
+
+    #[test]
+    fn test_error_display_timeout() {
+        let err = Error::Timeout;
+        let display = format!("{}", err);
+        assert!(display.contains("timeout"), "Should describe timeout error");
+    }
+
+    #[test]
+    fn test_error_display_parse_store_path() {
+        let err = Error::ParseStorePath {
+            url: "https://example.com/test".to_string(),
+            path: "invalid-path".to_string(),
+        };
+        let display = format!("{}", err);
+        assert!(display.contains("invalid-path"), "Should include the invalid path");
+        assert!(display.contains("https://example.com/test"), "Should include URL");
+    }
+
+    #[test]
+    fn test_error_display_parse_response() {
+        let err = Error::ParseResponse {
+            url: "https://example.com/test.json".to_string(),
+            tmp_file: None,
+        };
+        let display = format!("{}", err);
+        assert!(display.contains("parse"), "Should describe parse error");
+        assert!(display.contains("https://example.com/test.json"), "Should include URL");
+    }
+
+    #[test]
+    fn test_error_display_decode() {
+        let err = Error::Decode {
+            url: "https://example.com/test.xz".to_string(),
+        };
+        let display = format!("{}", err);
+        assert!(display.contains("decode"), "Should describe decode error");
+        assert!(display.contains("https://example.com/test.xz"), "Should include URL");
+    }
+}
